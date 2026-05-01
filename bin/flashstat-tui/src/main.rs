@@ -43,97 +43,81 @@ impl App {
         }
     }
 
-    async fn init(&mut self, client: &(impl FlashApiClient + Sync)) -> Result<()> {
-        if let Ok(blocks) = client.get_recent_blocks(50).await {
-            self.blocks = blocks;
-            if let Some(first) = self.blocks.first() {
-                self.latest_confidence = first.confidence;
+    fn update_blocks(&mut self, blocks: Vec<FlashBlock>) {
+        self.blocks = blocks;
+        if let Some(first) = self.blocks.first() {
+            self.latest_confidence = first.confidence;
+        }
+    }
+
+    fn update_latest_block(&mut self, block: FlashBlock) {
+        if self.blocks.first().map(|b| b.hash) != Some(block.hash) {
+            self.latest_confidence = block.confidence;
+            self.blocks.insert(0, block);
+            if self.blocks.len() > 50 {
+                self.blocks.pop();
             }
         }
-        if let Ok(recent_reorgs) = client.get_recent_reorgs(10).await {
+    }
+
+    fn update_sequencers(&mut self, mut sequencers: Vec<SequencerStats>) {
+        sequencers.sort_by_key(|s| std::cmp::Reverse(s.reputation_score));
+        self.sequencers = sequencers;
+    }
+
+    async fn init(&mut self, client: &(impl FlashApiClient + Sync)) -> Result<()> {
+        let (blocks_res, reorgs_res, seq_res) = tokio::join!(
+            client.get_recent_blocks(50),
+            client.get_recent_reorgs(10),
+            client.get_sequencer_rankings()
+        );
+
+        if let Ok(blocks) = blocks_res {
+            self.update_blocks(blocks);
+        }
+        if let Ok(recent_reorgs) = reorgs_res {
             self.reorgs = recent_reorgs;
         }
-        if let Ok(mut sequencers) = client.get_sequencer_rankings().await {
-            sequencers.sort_by_key(|s| std::cmp::Reverse(s.reputation_score));
-            self.sequencers = sequencers;
+        if let Ok(sequencers) = seq_res {
+            self.update_sequencers(sequencers);
         }
         Ok(())
     }
 
     async fn on_tick(&mut self, client: &(impl FlashApiClient + Sync)) -> Result<()> {
-        if let Ok(Some(block)) = client.get_latest_block().await {
-            #[allow(clippy::collapsible_if)]
-            if self.blocks.first().map(|b| b.hash) != Some(block.hash) {
-                self.latest_confidence = block.confidence;
-                self.blocks.insert(0, block);
-                if self.blocks.len() > 50 {
-                    self.blocks.pop();
-                }
-            }
-        }
+        let (block_res, reorgs_res, health_res, seq_res) = tokio::join!(
+            client.get_latest_block(),
+            client.get_recent_reorgs(10),
+            client.get_health(),
+            client.get_sequencer_rankings()
+        );
 
-        if let Ok(recent_reorgs) = client.get_recent_reorgs(10).await {
+        if let Ok(Some(block)) = block_res {
+            self.update_latest_block(block);
+        }
+        if let Ok(recent_reorgs) = reorgs_res {
             self.reorgs = recent_reorgs;
         }
-
-        if let Ok(health) = client.get_health().await {
+        if let Ok(health) = health_res {
             self.health = Some(health);
         }
-
-        if let Ok(mut sequencers) = client.get_sequencer_rankings().await {
-            sequencers.sort_by_key(|s| std::cmp::Reverse(s.reputation_score));
-            self.sequencers = sequencers;
+        if let Ok(sequencers) = seq_res {
+            self.update_sequencers(sequencers);
         }
 
         Ok(())
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    Terminal::new(backend).map_err(Into::into)
+}
 
-    let client = HttpClientBuilder::default().build("http://127.0.0.1:9944")?;
-
-    let mut app = App::new();
-    let _ = app.init(&client).await;
-    let tick_rate = Duration::from_millis(200);
-
-    loop {
-        terminal.draw(|f| ui(f, &app))?;
-
-        let timeout = tick_rate
-            .checked_sub(app.last_tick.elapsed())
-            .unwrap_or_default();
-
-        #[allow(clippy::collapsible_if)]
-        if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Down
-                        if !app.reorgs.is_empty() && app.selected_reorg < app.reorgs.len() - 1 =>
-                    {
-                        app.selected_reorg += 1;
-                    }
-                    KeyCode::Up if app.selected_reorg > 0 => {
-                        app.selected_reorg -= 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if app.last_tick.elapsed() >= tick_rate {
-            app.on_tick(&client).await?;
-            app.last_tick = Instant::now();
-        }
-    }
-
+fn restore_terminal(mut terminal: Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -141,8 +125,65 @@ async fn main() -> Result<()> {
         DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-
     Ok(())
+}
+
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    mut app: App,
+    client: &(impl FlashApiClient + Sync),
+    tick_rate: Duration,
+) -> Result<()> {
+    loop {
+        terminal.draw(|f| ui(f, &app))?;
+
+        let timeout = tick_rate
+            .checked_sub(app.last_tick.elapsed())
+            .unwrap_or_default();
+
+        if event::poll(timeout)?
+            && let Event::Key(key) = event::read()?
+            && handle_key_events(key, &mut app)
+        {
+            break;
+        }
+
+        if app.last_tick.elapsed() >= tick_rate {
+            app.on_tick(client).await?;
+            app.last_tick = Instant::now();
+        }
+    }
+    Ok(())
+}
+
+fn handle_key_events(key: event::KeyEvent, app: &mut App) -> bool {
+    match key.code {
+        KeyCode::Char('q') => return true,
+        KeyCode::Down if !app.reorgs.is_empty() && app.selected_reorg < app.reorgs.len() - 1 => {
+            app.selected_reorg += 1;
+        }
+        KeyCode::Up if app.selected_reorg > 0 => {
+            app.selected_reorg -= 1;
+        }
+        _ => {}
+    }
+    false
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut terminal = setup_terminal()?;
+
+    let client = HttpClientBuilder::default().build("http://127.0.0.1:9944")?;
+    let mut app = App::new();
+    let _ = app.init(&client).await;
+    let tick_rate = Duration::from_millis(200);
+
+    let res = run_app(&mut terminal, app, &client, tick_rate).await;
+
+    restore_terminal(terminal)?;
+
+    res
 }
 
 fn ui(f: &mut Frame, app: &App) {
@@ -159,30 +200,7 @@ fn ui(f: &mut Frame, app: &App) {
         )
         .split(f.size());
 
-    // Title / Confidence Gauge
-    let status_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
-        .split(chunks[0]);
-
-    let title = Paragraph::new(format!(
-        " 🏮 FlashStat Dashboard | Confidence: {:.2}%",
-        app.latest_confidence
-    ))
-    .block(Block::default().borders(Borders::ALL).title("Status"));
-    f.render_widget(title, status_chunks[0]);
-
-    let stats_text = if let Some(h) = &app.health {
-        format!(
-            " Uptime: {}s | Blocks: {} | Alerts: {} ",
-            h.uptime_secs, h.total_blocks, h.total_reorgs
-        )
-    } else {
-        " Connecting... ".to_string()
-    };
-    let stats = Paragraph::new(stats_text)
-        .block(Block::default().borders(Borders::ALL).title("System Stats"));
-    f.render_widget(stats, status_chunks[1]);
+    render_header(f, app, chunks[0]);
 
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -196,7 +214,40 @@ fn ui(f: &mut Frame, app: &App) {
         )
         .split(chunks[1]);
 
-    // Block Feed
+    render_block_feed(f, app, main_chunks[0]);
+    render_sequencer_reputation(f, app, main_chunks[1]);
+    render_reorg_log(f, app, main_chunks[2]);
+    render_analysis_details(f, app, chunks[2]);
+    render_controls(f, chunks[3]);
+}
+
+fn render_header(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
+        .split(area);
+
+    let title = Paragraph::new(format!(
+        " 🏮 FlashStat Dashboard | Confidence: {:.2}%",
+        app.latest_confidence
+    ))
+    .block(Block::default().borders(Borders::ALL).title("Status"));
+    f.render_widget(title, chunks[0]);
+
+    let stats_text = if let Some(h) = &app.health {
+        format!(
+            " Uptime: {}s | Blocks: {} | Alerts: {} ",
+            h.uptime_secs, h.total_blocks, h.total_reorgs
+        )
+    } else {
+        " Connecting... ".to_string()
+    };
+    let stats = Paragraph::new(stats_text)
+        .block(Block::default().borders(Borders::ALL).title("System Stats"));
+    f.render_widget(stats, chunks[1]);
+}
+
+fn render_block_feed(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let blocks: Vec<ListItem> = app
         .blocks
         .iter()
@@ -223,9 +274,10 @@ fn ui(f: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title("Live Block Feed"),
     );
-    f.render_widget(block_list, main_chunks[0]);
+    f.render_widget(block_list, area);
+}
 
-    // Sequencer Reputation
+fn render_sequencer_reputation(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let sequencers: Vec<ListItem> = app
         .sequencers
         .iter()
@@ -254,9 +306,10 @@ fn ui(f: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title("Sequencer Reputation"),
     );
-    f.render_widget(sequencer_list, main_chunks[1]);
+    f.render_widget(sequencer_list, area);
+}
 
-    // Reorg Log
+fn render_reorg_log(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let reorgs: Vec<ListItem> = app
         .reorgs
         .iter()
@@ -292,9 +345,10 @@ fn ui(f: &mut Frame, app: &App) {
         )
         .highlight_symbol(">> ");
 
-    f.render_widget(reorg_list, main_chunks[2]);
+    f.render_widget(reorg_list, area);
+}
 
-    // Analysis Details
+fn render_analysis_details(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let details_content = if let Some(reorg) = app.reorgs.get(app.selected_reorg) {
         let mut lines = vec![Line::from(vec![
             Span::styled("Event: ", Style::default().add_modifier(Modifier::BOLD)),
@@ -353,10 +407,11 @@ fn ui(f: &mut Frame, app: &App) {
             .borders(Borders::ALL)
             .title("Analysis Forensics (Selected Event)"),
     );
-    f.render_widget(details, chunks[2]);
+    f.render_widget(details, area);
+}
 
-    // Controls
+fn render_controls(f: &mut Frame, area: ratatui::layout::Rect) {
     let help = Paragraph::new(" [q] Quit | [↑/↓] Select Alert | [r] Refresh Proofs ")
         .block(Block::default().borders(Borders::ALL).title("Controls"));
-    f.render_widget(help, chunks[3]);
+    f.render_widget(help, area);
 }
